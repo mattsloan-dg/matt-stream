@@ -2,3 +2,5 @@
 .env
 *.wav
 __pycache__
+*.json
+*.txt

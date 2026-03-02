@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DEEPGRAM_WS_BASE = "wss://api.sandbox.deepgram.com/v1/listen"
+DEEPGRAM_WS_BASE = "wss://api.deepgram.com/v1/listen"
 
 
 class JsonFormatter(logging.Formatter):
@@ -88,6 +88,12 @@ def read_wav(file_path, logger):
         )
 
     duration_s = n_frames / sample_rate
+
+    if n_frames == 0 or len(audio_data) == 0 or duration_s == 0:
+        raise ValueError(
+            f"Audio file appears empty: frames={n_frames}, bytes={len(audio_data)}, duration_s={duration_s}"
+        )
+
     logger.info(
         "WAV file loaded",
         extra={
@@ -116,11 +122,11 @@ def build_ws_url(sample_rate, channels, extra_params):
     return f"{DEEPGRAM_WS_BASE}?{urlencode(params)}"
 
 
-async def send_audio(ws, audio_data, chunk_ms, bytes_per_ms, finalize, state, logger):
+async def send_audio(ws, audio_data, chunk_ms, bytes_per_ms, finalize, timer_offset_s, state, logger):
     chunk_bytes = int(bytes_per_ms * chunk_ms)
     offset = 0
     chunk_num = 0
-    timer_trigger_bytes = int(bytes_per_ms * 11000)  # 11 seconds in bytes
+    timer_trigger_bytes = int(bytes_per_ms * timer_offset_s * 1000)
     finalize_counter = 0  # Track iterations after threshold for periodic Finalize
 
     while offset < len(audio_data):
@@ -151,7 +157,7 @@ async def send_audio(ws, audio_data, chunk_ms, bytes_per_ms, finalize, state, lo
         if not state.timer_started.is_set() and offset >= timer_trigger_bytes:
             state.timer_start_time = time.perf_counter()
             state.timer_started.set()
-            logger.info("Timer started at 11s mark — measuring tail latency")
+            logger.info(f"Timer started at {timer_offset_s}s mark — measuring tail latency")
 
         # Send Finalize message every 4 iterations (once per second at 250ms) after threshold
         if finalize and offset >= timer_trigger_bytes:
@@ -178,6 +184,9 @@ async def receive_results(ws, state, logger):
             msg_type = msg.get("type", "")
 
             if msg_type == "Results":
+                print("=======================")
+                print(msg)
+                print("=======================")
                 channel = msg.get("channel", {})
                 alternatives = channel.get("alternatives", [{}])
                 transcript = alternatives[0].get("transcript", "") if alternatives else ""
@@ -195,8 +204,8 @@ async def receive_results(ws, state, logger):
                     }
                 }
 
-                # Measure time to first transcript (any Results message)
-                if state.first_transcript_time is None and state.connection_start_time > 0:
+                # Measure time to first transcript (only on non-empty transcripts)
+                if state.first_transcript_time is None and state.connection_start_time > 0 and transcript.strip():
                     time_to_first = time.perf_counter() - state.connection_start_time
                     state.first_transcript_time = time_to_first
                     log_data["extra"]["time_to_first_transcript_s"] = round(time_to_first, 4)
@@ -223,7 +232,8 @@ async def receive_results(ws, state, logger):
                 )
             elif msg_type == "UtteranceEnd":
                 logger.info(
-                    "Utterance End received: ", msg
+                    "UtteranceEnd received",
+                    extra={"extra": {"type": msg_type, "last_word_end": msg.get("last_word_end")}},
                 )
                 await ws.send(json.dumps({"type": "Finalize"}))
                 logger.info("Sent Finalize message")
@@ -241,7 +251,7 @@ async def receive_results(ws, state, logger):
         )
 
 
-async def run(file_path, chunk_ms, finalize, dg_params, logger):
+async def run(file_path, chunk_ms, finalize, timer_offset_s, dg_params, logger):
     api_key = os.environ.get("DEEPGRAM_API_KEY")
     if not api_key:
         logger.error("DEEPGRAM_API_KEY not set in environment or .env file")
@@ -272,7 +282,7 @@ async def run(file_path, chunk_ms, finalize, dg_params, logger):
 
     async with websockets.connect(url, additional_headers=headers) as ws:
         sender = asyncio.create_task(
-            send_audio(ws, audio_data, chunk_ms, bytes_per_ms, finalize, state, logger)
+            send_audio(ws, audio_data, chunk_ms, bytes_per_ms, finalize, timer_offset_s, state, logger)
         )
         receiver = asyncio.create_task(
             receive_results(ws, state, logger)
@@ -333,6 +343,13 @@ def main():
         help="Send a Finalize message after the last audio chunk",
     )
     parser.add_argument(
+        "--timer-offset",
+        type=float,
+        default=10.0,
+        dest="timer_offset_s",
+        help="Seconds into the audio to start the tail latency timer (default: 10)",
+    )
+    parser.add_argument(
         "--dg-param",
         type=parse_dg_param,
         action="append",
@@ -344,7 +361,7 @@ def main():
 
     logger = setup_logger()
 
-    asyncio.run(run(args.file_path, args.chunk_size, args.finalize, args.dg_params, logger))
+    asyncio.run(run(args.file_path, args.chunk_size, args.finalize, args.timer_offset_s, args.dg_params, logger))
 
 
 if __name__ == "__main__":
