@@ -184,12 +184,16 @@ async def receive_results(ws, state, logger):
             msg_type = msg.get("type", "")
 
             if msg_type == "Results":
-                print("=======================")
-                print(msg)
-                print("=======================")
                 channel = msg.get("channel", {})
                 alternatives = channel.get("alternatives", [{}])
                 transcript = alternatives[0].get("transcript", "") if alternatives else ""
+
+                if transcript == "":
+                    print("Results message came in with empty transcript")
+                else:
+                    print("=======================")
+                    print(json.dumps(msg, indent=4))
+                    print("=======================")
                 is_final = msg.get("is_final", False)
                 speech_final = msg.get("speech_final", False)
                 from_finalize = msg.get("from_finalize", False)
