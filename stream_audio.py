@@ -22,6 +22,7 @@ class JsonFormatter(logging.Formatter):
     GREEN = "\033[32m"
     YELLOW = "\033[33m"
     CYAN = "\033[36m"
+    BLUE = "\033[34m"
     RED = "\033[31m"
     RESET = "\033[0m"
 
@@ -40,13 +41,10 @@ class JsonFormatter(logging.Formatter):
         message = record.getMessage()
         if "Connecting to Deepgram" in message:
             return f"{self.GREEN}{json_output}{self.RESET}"
-        elif "Timer started at 11s mark" in message:
-            return f"{self.YELLOW}{json_output}{self.RESET}"
-        elif "First transcript received" in message or "Started sending audio" in message:
+        elif "First interim transcript received" in message or "First final transcript received" in message or "Transcript received" in message:
+            return f"{self.BLUE}{json_output}{self.RESET}"
+        elif "Started sending audio" in message:
             return f"{self.CYAN}{json_output}{self.RESET}"
-        elif "Tail latency exceeded threshold" in message:
-            return f"{self.RED}{json_output}{self.RESET}"
-
         return json_output
 
 
@@ -61,12 +59,11 @@ def setup_logger():
 
 @dataclass
 class StreamState:
-    timer_started: asyncio.Event = field(default_factory=asyncio.Event)
-    timer_start_time: float = 0.0
-    measured_elapsed: float | None = None
     send_finished: asyncio.Event = field(default_factory=asyncio.Event)
     connection_start_time: float = 0.0
-    first_transcript_time: float | None = None
+    first_interim_time: float | None = None
+    first_final_time: float | None = None
+    final_transcripts: list[str] = field(default_factory=list)
 
 
 def read_wav(file_path, logger):
@@ -112,22 +109,19 @@ def read_wav(file_path, logger):
 
 
 def build_ws_url(sample_rate, channels, extra_params):
-    params = {
-        "encoding": "linear16",
-        "sample_rate": sample_rate,
-        "channels": channels,
-    }
-    for key, value in extra_params:
-        params[key] = value
+    params = [
+        ("encoding", "linear16"),
+        ("sample_rate", sample_rate),
+        ("channels", channels),
+    ]
+    params.extend(extra_params)
     return f"{DEEPGRAM_WS_BASE}?{urlencode(params)}"
 
 
-async def send_audio(ws, audio_data, chunk_ms, bytes_per_ms, finalize, timer_offset_s, state, logger):
+async def send_audio(ws, audio_data, chunk_ms, bytes_per_ms, state, logger):
     chunk_bytes = int(bytes_per_ms * chunk_ms)
     offset = 0
     chunk_num = 0
-    timer_trigger_bytes = int(bytes_per_ms * timer_offset_s * 1000)
-    finalize_counter = 0  # Track iterations after threshold for periodic Finalize
 
     while offset < len(audio_data):
         chunk = audio_data[offset : offset + chunk_bytes]
@@ -148,23 +142,10 @@ async def send_audio(ws, audio_data, chunk_ms, bytes_per_ms, finalize, timer_off
         # Start time-to-first-transcript timer on first chunk
         if chunk_num == 1:
             state.connection_start_time = time.perf_counter()
-            logger.info("Started sending audio — measuring time to first transcript")
+            logger.info("Started sending audio")
 
         await ws.send(chunk)
         offset += chunk_bytes
-
-        # Start timer at 10 seconds in (once)
-        if not state.timer_started.is_set() and offset >= timer_trigger_bytes:
-            state.timer_start_time = time.perf_counter()
-            state.timer_started.set()
-            logger.info(f"Timer started at {timer_offset_s}s mark — measuring tail latency")
-
-        # Send Finalize message every 4 iterations (once per second at 250ms) after threshold
-        if finalize and offset >= timer_trigger_bytes:
-            finalize_counter += 1
-            if finalize_counter % 4 == 1:  # Send on 1st, 5th, 9th, etc. iteration after threshold
-                await ws.send(json.dumps({"type": "Finalize"}))
-                logger.info("Sent Finalize message")
 
         if is_last:
             last_chunk_ms = len(chunk) / bytes_per_ms
@@ -198,6 +179,9 @@ async def receive_results(ws, state, logger):
                 speech_final = msg.get("speech_final", False)
                 from_finalize = msg.get("from_finalize", False)
 
+                if is_final and transcript.strip():
+                    state.final_transcripts.append(transcript)
+
                 log_data = {
                     "extra": {
                         "type": msg_type,
@@ -208,26 +192,23 @@ async def receive_results(ws, state, logger):
                     }
                 }
 
-                # Measure time to first transcript (only on non-empty transcripts)
-                if state.first_transcript_time is None and state.connection_start_time > 0 and transcript.strip():
-                    time_to_first = time.perf_counter() - state.connection_start_time
-                    state.first_transcript_time = time_to_first
-                    log_data["extra"]["time_to_first_transcript_s"] = round(time_to_first, 4)
-                    logger.info("First transcript received", extra=log_data)
-                # Measure tail latency: update for ANY non-empty transcript after timer started
-                elif state.timer_started.is_set() and transcript.strip():
-                    elapsed = time.perf_counter() - state.timer_start_time
-                    is_first_measurement = state.measured_elapsed is None
-                    state.measured_elapsed = elapsed
-                    log_data["extra"]["tail_latency_s"] = round(elapsed, 4)
+                # Calculate latency for every non-empty result
+                if state.connection_start_time > 0 and transcript.strip():
+                    words = alternatives[0].get("words", []) if alternatives else []
+                    first_word_start = words[0]["start"] if words else 0.0
+                    latency = time.perf_counter() - state.connection_start_time - first_word_start
+                    log_data["extra"]["first_word_start_s"] = first_word_start
+                    log_data["extra"]["latency_s"] = round(latency, 4)
 
-                    if is_first_measurement:
-                        logger.info("Tail latency measured on is_final", extra=log_data)
+                    # Track first interim and first final for summary
+                    if not is_final and state.first_interim_time is None:
+                        state.first_interim_time = latency
+                        logger.info("First interim transcript received", extra=log_data)
+                    elif is_final and state.first_final_time is None:
+                        state.first_final_time = latency
+                        logger.info("First final transcript received", extra=log_data)
                     else:
-                        log_data["extra"]["updated"] = True
-                        logger.info("Tail latency updated - non-empty trailing transcript", extra=log_data)
-                elif transcript.strip():
-                    logger.info("Transcript received", extra=log_data)
+                        logger.info("Transcript received", extra=log_data)
 
             elif msg_type == "Metadata":
                 logger.info(
@@ -255,7 +236,20 @@ async def receive_results(ws, state, logger):
         )
 
 
-async def run(file_path, chunk_ms, finalize, timer_offset_s, dg_params, logger):
+def print_final_transcript(state: StreamState, logger: logging.Logger) -> None:
+    """Print the accumulated final transcript to stdout."""
+    if state.final_transcripts:
+        full_transcript = " ".join(state.final_transcripts)
+        print("\n" + "=" * 60)
+        print("FINAL TRANSCRIPT")
+        print("=" * 60)
+        print(full_transcript)
+        print("=" * 60 + "\n")
+    else:
+        logger.info("No final transcripts were received")
+
+
+async def run(file_path, chunk_ms, dg_params, logger):
     api_key = os.environ.get("DEEPGRAM_API_KEY")
     if not api_key:
         logger.error("DEEPGRAM_API_KEY not set in environment or .env file")
@@ -276,7 +270,6 @@ async def run(file_path, chunk_ms, finalize, timer_offset_s, dg_params, logger):
                 "url": url,
                 "chunk_ms": chunk_ms,
                 "chunk_bytes": int(bytes_per_ms * chunk_ms),
-                "finalize": finalize,
                 "bytes_per_second": bytes_per_second,
             }
         },
@@ -284,42 +277,32 @@ async def run(file_path, chunk_ms, finalize, timer_offset_s, dg_params, logger):
 
     state = StreamState()
 
-    async with websockets.connect(url, additional_headers=headers) as ws:
-        sender = asyncio.create_task(
-            send_audio(ws, audio_data, chunk_ms, bytes_per_ms, finalize, timer_offset_s, state, logger)
-        )
-        receiver = asyncio.create_task(
-            receive_results(ws, state, logger)
-        )
-        await asyncio.gather(sender, receiver)
+    try:
+        async with websockets.connect(url, additional_headers=headers) as ws:
+            sender = asyncio.create_task(
+                send_audio(ws, audio_data, chunk_ms, bytes_per_ms, state, logger)
+            )
+            receiver = asyncio.create_task(
+                receive_results(ws, state, logger)
+            )
+            await asyncio.gather(sender, receiver)
+    except asyncio.CancelledError:
+        logger.info("Stream interrupted")
+    finally:
+        print_final_transcript(state, logger)
 
     # Log final summary with all metrics
     summary = {
-        "finalize": finalize,
         "chunk_ms": chunk_ms,
     }
 
-    if state.first_transcript_time is not None:
-        summary["time_to_first_transcript_s"] = round(state.first_transcript_time, 4)
+    if state.first_interim_time is not None:
+        summary["time_to_first_interim_s"] = round(state.first_interim_time, 4)
 
-    if state.measured_elapsed is not None:
-        summary["tail_latency_s"] = round(state.measured_elapsed, 4)
-        logger.info("Session complete", extra={"extra": summary})
+    if state.first_final_time is not None:
+        summary["time_to_first_final_s"] = round(state.first_final_time, 4)
 
-        # Check if tail latency exceeds threshold
-        if state.measured_elapsed > 2.5:
-            logger.warning(
-                "Tail latency exceeded threshold",
-                extra={
-                    "extra": {
-                        "tail_latency_s": round(state.measured_elapsed, 4),
-                        "threshold_s": 2.5,
-                        "exceeded_by_s": round(state.measured_elapsed - 2.5, 4),
-                    }
-                }
-            )
-    else:
-        logger.warning("No is_final message received after timer started", extra={"extra": summary})
+    logger.info("Session complete", extra={"extra": summary})
 
 
 def parse_dg_param(value):
@@ -332,7 +315,7 @@ def parse_dg_param(value):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Stream a Linear16 WAV file to Deepgram and measure tail latency"
+        description="Stream a Linear16 WAV file to Deepgram"
     )
     parser.add_argument("file_path", help="Path to a Linear16 WAV file")
     parser.add_argument(
@@ -340,18 +323,6 @@ def main():
         type=int,
         default=250,
         help="Chunk size in milliseconds (default: 250)",
-    )
-    parser.add_argument(
-        "--finalize",
-        action="store_true",
-        help="Send a Finalize message after the last audio chunk",
-    )
-    parser.add_argument(
-        "--timer-offset",
-        type=float,
-        default=10.0,
-        dest="timer_offset_s",
-        help="Seconds into the audio to start the tail latency timer (default: 10)",
     )
     parser.add_argument(
         "--dg-param",
@@ -365,7 +336,10 @@ def main():
 
     logger = setup_logger()
 
-    asyncio.run(run(args.file_path, args.chunk_size, args.finalize, args.timer_offset_s, args.dg_params, logger))
+    try:
+        asyncio.run(run(args.file_path, args.chunk_size, args.dg_params, logger))
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
 
 
 if __name__ == "__main__":
