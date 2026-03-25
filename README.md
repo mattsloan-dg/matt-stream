@@ -20,28 +20,48 @@ Set `DEEPGRAM_API_KEY` in `.env` with your key.
 
 ### stream_audio.py
 
-Stream a Linear16 WAV file to Deepgram and measure tail latency + time-to-first-transcript. The tail latency timer starts at a configurable offset into the audio stream.
+Stream a Linear16 WAV file to Deepgram and measure per-result latency relative to the start of the first word in each result. Tracks time-to-first-interim and time-to-first-final transcript, and prints the accumulated final transcript at the end.
 
 ```bash
 python stream_audio.py <file_path> [options]
 ```
 
-| Option                 | Description                                    | Default |
-| ---------------------- | ---------------------------------------------- | ------- |
-| `--chunk-size INT`     | Chunk size in milliseconds                     | `250`   |
-| `--finalize`           | Send Finalize message after last audio chunk   | off     |
-| `--timer-offset FLOAT` | Seconds into audio to start tail latency timer | `10`    |
-| `--dg-param KEY=VALUE` | Deepgram query parameter (repeatable)          | none    |
+| Option                 | Description                           | Default |
+| ---------------------- | ------------------------------------- | ------- |
+| `--chunk-size INT`     | Chunk size in milliseconds            | `250`   |
+| `--dg-param KEY=VALUE` | Deepgram query parameter (repeatable) | none    |
 
 ```bash
 # Basic usage
 python stream_audio.py audio.wav
 
-# Custom model with finalize enabled
-python stream_audio.py audio.wav --dg-param model=nova-3 --finalize
+# Custom model with smaller chunks
+python stream_audio.py audio.wav --dg-param model=nova-3 --chunk-size 100
+```
 
-# Smaller chunks with 5s timer offset
-python stream_audio.py audio.wav --chunk-size 100 --timer-offset 5
+---
+
+### measure_tail_latency.py
+
+Measure tail latency of Deepgram streaming transcription. Starts a timer at a configurable offset into the audio and measures the time until the last transcript result is received. Supports optional periodic Finalize messages.
+
+```bash
+python measure_tail_latency.py <file_path> [options]
+```
+
+| Option                 | Description                                        | Default |
+| ---------------------- | -------------------------------------------------- | ------- |
+| `--chunk-size INT`     | Chunk size in milliseconds                         | `250`   |
+| `--finalize`           | Send periodic Finalize messages after timer offset | off     |
+| `--timer-offset FLOAT` | Seconds into audio to start tail latency timer     | `10`    |
+| `--dg-param KEY=VALUE` | Deepgram query parameter (repeatable)              | none    |
+
+```bash
+# Basic tail latency measurement
+python measure_tail_latency.py audio.wav
+
+# With finalize messages and custom timer offset
+python measure_tail_latency.py audio.wav --finalize --timer-offset 5 --dg-param model=nova-3
 ```
 
 ---
